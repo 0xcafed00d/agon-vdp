@@ -45,8 +45,7 @@
 #define REVISION 3
 #define RC 0
 
-#define DEBUG 0     // Serial Debug Mode: 1 = enable
-#define SERIALKB 1  // Serial Keyboard: 1 = enable (Experimental)
+#define DEBUG 0  // Serial Debug Mode: 1 = enable
 
 fabgl::PS2Controller PS2Controller;    // The keyboard class
 fabgl::Canvas* Canvas;                 // The canvas class
@@ -96,13 +95,14 @@ bool initialised = false;     // Is the system initialised yet?
 bool doWaitCompletion;        // For vdu function
 uint8_t palette[64];          // Storage for the palette
 
+bool keyboard_debug = false;  // Debug keyboard input
+bool remote_screen = false;   // Remote screen mode
+
 audio_channel* audio_channels[AUDIO_CHANNELS];  // Storage for the channel data
 
 ESP32Time rtc(0);  // The RTC
 
-#if DEBUG == 1 || SERIALKB == 1
-HardwareSerial DBGSerial(0);
-#endif
+HardwareSerial USBSerial(0);
 
 #include "video_fwd.h"
 
@@ -111,9 +111,7 @@ void setup() {
 	delay(200);  // Disable the watchdog timers
 	disableCore1WDT();
 	delay(200);
-#if DEBUG == 1 || SERIALKB == 1
-	DBGSerial.begin(UART_BR, SERIAL_8N1, 3, 1);
-#endif
+	USBSerial.begin(UART_BR, SERIAL_8N1, 3, 1);
 	ESPSerial.end();
 	ESPSerial.setRxBufferSize(UART_RX_SIZE);  // Can't be called when running
 	ESPSerial.begin(UART_BR, SERIAL_8N1, UART_RX, UART_TX);
@@ -148,7 +146,9 @@ void loop() {
 			continue;
 		}
 
-		cursorVisible = ((count & 0xFFFF) == 0);
+		handleRemoteKeyboard();
+
+		cursorVisible = ((count & 0x3FFF) == 0);
 		if (cursorVisible) {
 			cursorState = !cursorState;
 			do_cursor();
@@ -165,7 +165,9 @@ void loop() {
 				do_cursor();
 			}
 			byte c = ESPSerial.read();
-			DBGSerial.write(c);
+			if (remote_screen) {
+				USBSerial.write(c);
+			}
 			vdu(c);
 		}
 #if USE_HWFLOW == 0
@@ -174,6 +176,39 @@ void loop() {
 		}
 #endif
 		count++;
+	}
+}
+
+byte checksum(byte* data, int len) {
+	byte sum = 0;
+	for (int i = 0; i < len; i++) {
+		sum += data[i];
+	}
+	return -sum;
+}
+
+void handleRemoteKeyboard() {
+	// packet format: 0xff, char, keycode, modifiers, checksum
+	//                0     1     2        3          4
+	static byte buffer[6];
+	static int index = 0;
+
+	if (remote_screen && USBSerial.available()) {
+		byte b = USBSerial.read();
+		if (b == 0xff) {
+			index = 0;
+		}
+		buffer[index++] = b;
+
+		if (index == 4) {
+			// Got a full packet
+			byte sum = checksum(buffer, 4);
+			if (sum == buffer[4]) {
+				byte packet[] = {buffer[1], buffer[3] & 0x7f, buffer[2], buffer[3] & 0x80 ? 1 : 0};
+				send_packet(PACKET_KEYCODE, sizeof packet, packet);
+			}
+			index = 0;
+		}
 	}
 }
 
@@ -199,7 +234,7 @@ void debug_log(const char* format, ...) {
 		va_start(ap, format);
 		char buf[size + 1];
 		vsnprintf(buf, size, format, ap);
-		DBGSerial.print(buf);
+		USBSerial.print(buf);
 	}
 	va_end(ap);
 #endif
@@ -777,17 +812,6 @@ void do_keyboard() {
 	fabgl::Keyboard* kb = PS2Controller.keyboard();
 	fabgl::VirtualKeyItem item;
 
-#if SERIALKB == 1
-	if (DBGSerial.available()) {
-		byte key = DBGSerial.read();
-		byte packetdown[] = {key, 0, 0, 1};
-		send_packet(PACKET_KEYCODE, sizeof packetdown, packetdown);
-		byte packetup[] = {key, 0, 0, 0};
-		send_packet(PACKET_KEYCODE, sizeof packetup, packetup);
-		return;
-	}
-#endif
-
 	if (kb->getNextVirtualKey(&item, 0)) {
 		if (item.down) {
 			switch (item.vk) {
@@ -838,6 +862,9 @@ void do_keyboard() {
 		    item.down,
 		};
 		send_packet(PACKET_KEYCODE, sizeof packet, packet);
+		if (keyboard_debug) {  // sends keybord data to the outside world for debugging
+			send_packetex(PACKET_KEYCODE, sizeof packet, packet);
+		}
 	}
 }
 
@@ -848,6 +875,15 @@ void send_packet(byte code, byte len, byte data[]) {
 	ESPSerial.write(len);
 	for (int i = 0; i < len; i++) {
 		ESPSerial.write(data[i]);
+	}
+}
+
+// send a packet of data to the outside world
+void send_packetex(byte code, byte len, byte data[]) {
+	USBSerial.write(code + 0x80);
+	USBSerial.write(len);
+	for (int i = 0; i < len; i++) {
+		USBSerial.write(data[i]);
 	}
 }
 
@@ -1283,6 +1319,14 @@ void vdu_sys_video() {
 			if (b >= 0) {
 				logicalCoords = b;
 			}
+		} break;
+		case VDP_REMOTESCREEN: {   // VDU 23, 0, &E0, 0/1
+			int b = readByte_t();  // Set remote screen mode
+			remote_screen = (b != 0);
+		} break;
+		case VDP_KEYBOARDDEBUG: {  // VDU 23, 0, &E1, 0/1
+			int b = readByte_t();  // Set keyboard debug mode
+			keyboard_debug = (b != 0);
 		} break;
 		case VDP_TERMINALMODE: {   // VDU 23, 0, &FF
 			switchTerminalMode();  // Switch to terminal mode
